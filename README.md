@@ -23,9 +23,9 @@
 无构建、无依赖安装，单脚本即用：
 
 ```bash
-git clone https://github.com/<user>/session-resolver.git
+git clone https://github.com/zhangweijian97/session-resolver.git
 # 或只取脚本：
-curl -O https://raw.githubusercontent.com/<user>/session-resolver/main/session-resolver.sh && chmod +x session-resolver.sh
+curl -O https://raw.githubusercontent.com/zhangweijian97/session-resolver/main/session-resolver.sh && chmod +x session-resolver.sh
 ```
 
 依赖：`bash` + `python3`；查询 ZCode 会话需 `sqlite3`（macOS 自带）；查询 dsh 会话需 `zstd`（`brew install zstd`）。

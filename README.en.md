@@ -23,9 +23,9 @@ In workflows that run multiple AI coding CLIs (Claude Code + Codex + …), each 
 No build, no install step — a single script:
 
 ```bash
-git clone https://github.com/<user>/session-resolver.git
+git clone https://github.com/zhangweijian97/session-resolver.git
 # or just the script:
-curl -O https://raw.githubusercontent.com/<user>/session-resolver/main/session-resolver.sh && chmod +x session-resolver.sh
+curl -O https://raw.githubusercontent.com/zhangweijian97/session-resolver/main/session-resolver.sh && chmod +x session-resolver.sh
 ```
 
 Dependencies: `bash` + `python3`; ZCode queries need `sqlite3` (bundled on macOS); dsh queries need `zstd` (`brew install zstd`). CLI messages are in Chinese (the project's primary audience is Chinese-speaking; contributions to localize messages are welcome).
