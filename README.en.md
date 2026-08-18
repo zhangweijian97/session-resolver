@@ -1,9 +1,10 @@
 # session-resolver
 
-Cross-client session identity & content resolver for AI coding CLIs — one bash script, two capabilities:
+Cross-client session identity & content resolver for AI coding CLIs — one bash script, three capabilities:
 
 - **identify**: answer "which session am I in" from inside a session (returns a standard ID)
 - **resolve**: read a session's metadata and message content by ID (returns JSON)
+- **list**: enumerate recent sessions (standard ID + time + title, `--since` filter)
 
 Supports **Claude Code / Codex / dsh (DeepSeek Harness) / ZCode** with a unified ID format and unified output structure — your script parses one format, regardless of which client produced the session.
 
@@ -87,6 +88,19 @@ content returns a unified message sequence; each message carries `role` / `time_
 ```
 
 Part types are uniform across clients: `text` / `reasoning` / `tool` (call + result in one object: input/output) / `file`.
+
+```bash
+# 4. Enumerate recent sessions (merged across clients, newest first):
+./session-resolver.sh list --since 3d
+./session-resolver.sh list --since 12h --framework claude-code,codex
+```
+
+```text
+claude-code:bc3e96c7-a925-4c2e-ac9a-ccf181a3a388	2026-08-18 01:11	verify the cc adapter
+codex:019fcaad-12a9-7351-b533-94a79f6bfa0b	2026-08-04 10:50	we switched the system prompt to a symlink...
+```
+
+`--since` takes `3d` / `12h` / `30m` (combinable, e.g. `1d12h`); a missing client data root is skipped with a warning instead of failing the whole listing. Typical flow: `list` for the overview, then `resolve meta` / `resolve content` on the sessions worth a deeper look.
 
 ## The Three Shapes of identify
 

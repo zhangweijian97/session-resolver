@@ -1,9 +1,10 @@
 # session-resolver
 
-跨 AI 编程客户端的会话身份与内容解析工具——一个 bash 脚本，两个能力：
+跨 AI 编程客户端的会话身份与内容解析工具——一个 bash 脚本，三个能力：
 
 - **identify**：在会话内部回答"我是哪个会话"（返回标准 ID）
 - **resolve**：按 ID 读取会话的元数据与消息正文（返回 JSON）
+- **list**：枚举近期会话（标准 ID + 时间 + 标题，`--since` 时间过滤）
 
 支持 **Claude Code / Codex / dsh（DeepSeek Harness）/ ZCode** 四种客户端，统一 ID 格式、统一输出结构——你的脚本只写一份解析逻辑，不随框架分叉。
 
@@ -87,6 +88,19 @@ content 返回统一的消息序列，每条消息含 `role` / `time_created` / 
 ```
 
 part 类型在所有框架间统一：`text`（正文）/ `reasoning`（模型推理）/ `tool`（工具调用+返回，同一对象内含 input/output）/ `file`。
+
+```bash
+# 4. 枚举近期会话（跨客户端合并，按最后活动时间倒序）：
+./session-resolver.sh list --since 3d
+./session-resolver.sh list --since 12h --framework claude-code,codex
+```
+
+```text
+claude-code:bc3e96c7-a925-4c2e-ac9a-ccf181a3a388	2026-08-18 01:11	验证一下会话解析器的cc适配
+codex:019fcaad-12a9-7351-b533-94a79f6bfa0b	2026-08-04 10:50	我们将系统提示词改成了软链接的形式...
+```
+
+`--since` 支持 `3d` / `12h` / `30m`（可组合如 `1d12h`）；某客户端未安装时自动跳过并警告，不阻断其他客户端枚举。典型用法：先 `list` 拿清单，再对值得深入的会话 `resolve meta` / `resolve content`。
 
 ## identify 的三种形态
 

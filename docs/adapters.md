@@ -84,4 +84,4 @@
 7. **消息关联**：工具调用与返回如何关联（call_id / tool_use_id）？挂载到哪条消息？
 8. **验证样本**：至少测活跃会话 + 归档会话各一，确认新旧格式兼容。
 
-实现侧：identify 一个函数（框架检测 + ID 提取）+ resolve meta/content 各一个函数（记录 → 统一 parts 映射），注册到路由 case 即可。
+实现侧：identify 一个函数（框架检测 + ID 提取）+ resolve meta/content 各一个函数（记录 → 统一 parts 映射）+ list 枚举一段（会话发现 + mtime + 标题来源），注册到路由 case 即可。list 的标题来源与 meta 的 title 派生规则同源，勘察一次两处复用。

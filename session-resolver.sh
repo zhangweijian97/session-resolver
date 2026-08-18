@@ -7,7 +7,7 @@ set -euo pipefail
 
 # ─── 常量 ────────────────────────────────────────────
 
-readonly VERSION="0.4.0"
+readonly VERSION="0.5.0"
 readonly ZCODE_DB="${HOME}/.zcode/cli/db/db.sqlite"
 readonly CODEX_ROOT="${CODEX_HOME:-${HOME}/.codex}"
 readonly CODEX_SESSIONS="${CODEX_ROOT}/sessions"
@@ -1149,6 +1149,229 @@ print(json.dumps(messages, ensure_ascii=False, indent=2))
 PY
 }
 
+# ─── list：近期会话枚举 ──────────────────────────────
+
+# 枚举近期会话（标准 ID + 最后活动时间 + 标题），跨框架合并按时间倒序
+# 各框架存储知识复用 resolve 的勘察结论（见设计文档「list（枚举）」段）
+list_sessions() {
+  local since="" frameworks=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since) since="$2"; shift 2 ;;
+      --framework) frameworks="$2"; shift 2 ;;
+      *) die "未知参数: $1" ;;
+    esac
+  done
+
+  # framework 值域校验（逗号分隔多值）
+  if [[ -n "$frameworks" ]]; then
+    local fw
+    for fw in ${frameworks//,/ }; do
+      case "$fw" in
+        zcode|codex|dsh|claude-code) ;;
+        *) die "未知框架: '$fw'（可用: zcode, codex, dsh, claude-code）" ;;
+      esac
+    done
+  fi
+
+  python3 - "$since" "$frameworks" <<'PY'
+import json, os, re, shutil, sqlite3, subprocess, sys, time
+
+since_raw, fw_raw = sys.argv[1], sys.argv[2]
+home = os.path.expanduser("~")
+
+# --since 解析: 3d / 12h / 30m / 1d12h → epoch 秒下限; 空 = 全量
+since_s = 0.0
+if since_raw:
+    if not re.fullmatch(r"(?:\d+[dhm])+", since_raw):
+        sys.stderr.write(f"无效 --since 格式: {since_raw}（示例: 3d, 12h, 30m, 1d12h）\n")
+        sys.exit(1)
+    total = sum(int(n) * u for n, u in (
+        (n, {"d": 86400, "h": 3600, "m": 60}[unit])
+        for n, unit in re.findall(r"(\d+)([dhm])", since_raw)
+    ))
+    since_s = time.time() - total
+
+frameworks = [f.strip() for f in fw_raw.split(",") if f.strip()] \
+    or ["zcode", "codex", "dsh", "claude-code"]
+
+rows = []  # (mtime_epoch, standard_id, title)
+
+def clean_title(s):
+    return " ".join(str(s).split())[:80]
+
+# --- zcode: session 表 SQL 过滤（time_updated 毫秒）---
+if "zcode" in frameworks:
+    db = os.path.join(home, ".zcode/cli/db/db.sqlite")
+    if not os.path.isfile(db):
+        sys.stderr.write(f"警告: zcode 数据库不存在，跳过（{db}）\n")
+    else:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            for sid, title, tu in con.execute(
+                "SELECT id, title, time_updated FROM session WHERE time_updated > ?",
+                (int(since_s * 1000),),
+            ):
+                rows.append((tu / 1000, f"zcode:{sid}", clean_title(title or "")))
+            con.close()
+        except Exception as e:
+            sys.stderr.write(f"警告: zcode 枚举失败: {e}\n")
+
+# --- codex: rollout 文件扫描，同 thread 多文件去重（mtime 取最新，标题读最早文件）---
+if "codex" in frameworks:
+    codex_root = os.environ.get("CODEX_HOME", os.path.join(home, ".codex"))
+    roots = [os.path.join(codex_root, "sessions"), os.path.join(codex_root, "archived_sessions")]
+    uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+    if not any(os.path.isdir(r) for r in roots):
+        sys.stderr.write(f"警告: codex 会话目录不存在，跳过（{codex_root}）\n")
+    else:
+        threads = {}  # thread-id -> [max_mtime, earliest_path]
+        for root in roots:
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                        continue
+                    m = uuid_re.search(name)
+                    if not m:
+                        continue
+                    p = os.path.join(dirpath, name)
+                    mt = os.path.getmtime(p)
+                    cur = threads.get(m.group(0))
+                    if cur is None:
+                        threads[m.group(0)] = [mt, p]
+                    else:
+                        cur[0] = max(cur[0], mt)
+                        if name < os.path.basename(cur[1]):
+                            cur[1] = p  # 文件名含时间戳，最早文件承载 session_meta + 首条用户消息
+
+        def codex_title(path):
+            try:
+                with open(path) as fh:
+                    for i, line in enumerate(fh):
+                        if i >= 200:
+                            break
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        p = rec.get("payload") or {}
+                        if rec.get("type") == "event_msg" and p.get("type") == "user_message":
+                            msg = str(p.get("message") or "").strip()
+                            if msg:
+                                return clean_title(msg)
+            except Exception:
+                pass
+            return ""
+
+        for sid, (mt, earliest) in threads.items():
+            if since_s and mt < since_s:
+                continue
+            rows.append((mt, f"codex:{sid}", codex_title(earliest)))
+
+# --- dsh: 会话目录扫描（sid=目录名），zstd 解压流取显式 title ---
+if "dsh" in frameworks:
+    dsh_root = os.environ.get("DSH_HOME", os.path.join(home, ".dsh"))
+    sess_root = os.path.join(dsh_root, "sessions")
+    if not os.path.isdir(sess_root):
+        sys.stderr.write(f"警告: dsh 会话目录不存在，跳过（{dsh_root}）\n")
+    elif not shutil.which("zstd"):
+        sys.stderr.write("警告: zstd 未安装，dsh 枚举跳过（brew install zstd）\n")
+    else:
+        def dsh_title(zf):
+            title, first_user = "", ""
+            try:
+                proc = subprocess.Popen(["zstd", "-dc", zf], stdout=subprocess.PIPE, text=True)
+                for line in proc.stdout:
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    t = rec.get("type")
+                    d = rec.get("data") or {}
+                    if t == "session/title":
+                        title = d.get("title") or title
+                    elif t == "user/message" and not first_user:
+                        for c in (d.get("content") or []):
+                            if c.get("type") == "text" and str(c.get("text", "")).strip():
+                                first_user = str(c["text"]).strip()
+                                break
+                proc.wait()
+            except Exception:
+                pass
+            return clean_title(title or first_user)
+
+        for ws in os.listdir(sess_root):
+            wsd = os.path.join(sess_root, ws)
+            if not os.path.isdir(wsd):
+                continue
+            for sid in os.listdir(wsd):
+                zf = os.path.join(wsd, sid, "session.jsonl.zstd")
+                if not os.path.isfile(zf):
+                    continue
+                mt = os.path.getmtime(zf)
+                if since_s and mt < since_s:
+                    continue
+                rows.append((mt, f"dsh:{sid}", dsh_title(zf)))
+
+# --- claude-code: projects 深度 2 扫描（天然排除 subagents/，sid=文件名）---
+if "claude-code" in frameworks:
+    cc_root = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(home, ".claude"))
+    proj = os.path.join(cc_root, "projects")
+    if not os.path.isdir(proj):
+        sys.stderr.write(f"警告: claude-code 会话目录不存在，跳过（{proj}）\n")
+    else:
+        def claude_title(path):
+            first_user, slug = "", ""
+            try:
+                with open(path) as fh:
+                    for i, line in enumerate(fh):
+                        if i >= 200:
+                            break
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        t = rec.get("type")
+                        if t not in ("user", "assistant"):
+                            continue
+                        if not slug and rec.get("slug"):
+                            slug = rec["slug"]
+                        if t == "user" and not first_user:
+                            m = rec.get("message") or {}
+                            c = m.get("content")
+                            if isinstance(c, str) and c.strip():
+                                first_user = c.strip()
+                            elif isinstance(c, list):
+                                for part in c:
+                                    if isinstance(part, dict) and part.get("type") == "text" \
+                                            and str(part.get("text", "")).strip():
+                                        first_user = str(part["text"]).strip()
+                                        break
+                        if first_user and slug:
+                            break
+            except Exception:
+                pass
+            return clean_title(first_user or slug)
+
+        for d in os.listdir(proj):
+            dp = os.path.join(proj, d)
+            if not os.path.isdir(dp):
+                continue
+            for name in os.listdir(dp):
+                p = os.path.join(dp, name)
+                if not (os.path.isfile(p) and name.endswith(".jsonl")):
+                    continue
+                mt = os.path.getmtime(p)
+                if since_s and mt < since_s:
+                    continue
+                rows.append((mt, f"claude-code:{name[:-len('.jsonl')]}", claude_title(p)))
+
+rows.sort(key=lambda r: r[0], reverse=True)
+for mt, sid, title in rows:
+    print(f"{sid}\t{time.strftime('%Y-%m-%d %H:%M', time.localtime(mt))}\t{title}")
+PY
+}
+
 # ─── 用法 ────────────────────────────────────────────
 
 usage() {
@@ -1168,6 +1391,12 @@ session-resolver v${VERSION} — 会话身份适配器
   session-resolver.sh resolve content <标准ID> [--limit N] [--offset N]
     查询会话消息正文（角色 + 正文片段序列）
     可选 --limit/--offset 分段查询
+
+  session-resolver.sh list [--since 3d] [--framework zcode|codex|dsh|claude-code]
+    枚举近期会话（标准 ID + 最后活动时间 + 标题），按时间倒序
+    --since: 时间过滤（3d / 12h / 30m，可组合如 1d12h；不传 = 全量）
+    --framework: 逗号分隔多值过滤；不传 = 全部框架合并
+    输出: 一行一条 <标准ID>\t<本地时间 YYYY-MM-DD HH:MM>\t<标题截断80>
 
   session-resolver.sh --version
     显示版本号
@@ -1218,6 +1447,9 @@ main() {
           ;;
       esac
       ;;
+    list)
+      list_sessions "$@"
+      ;;
     --version|-v)
       echo "session-resolver v${VERSION}"
       ;;
@@ -1225,7 +1457,7 @@ main() {
       usage
       ;;
     *)
-      die "未知命令: '$cmd'。可用: identify, resolve, --help"
+      die "未知命令: '$cmd'。可用: identify, resolve, list, --help"
       ;;
   esac
 }

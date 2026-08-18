@@ -2,9 +2,10 @@
 name: session-resolver
 description: >
   会话身份适配器——跨智能体框架的会话 ID 标准化与解析工具。
-  提供两个核心能力：identify（在会话中获取自己的标准 ID）和 resolve（按 ID 查询会话内容）。
-  当需要获取当前会话 ID、或跨会话读取历史会话内容（元数据/消息正文）时触发。
-version: 0.4.0
+  提供三个核心能力：identify（在会话中获取自己的标准 ID）、resolve（按 ID 查询会话内容）、
+  list（枚举近期会话）。当需要获取当前会话 ID、跨会话读取历史会话内容（元数据/消息正文）、
+  或扫近期会话清单（定时回看/异步反思入口）时触发。
+version: 0.5.0
 tags: [session, identity, resolver, zcode, codex, dsh, claude-code]
 ---
 
@@ -19,6 +20,7 @@ tags: [session, identity, resolver, zcode, codex, dsh, claude-code]
 | **identify** | `identify` | 在会话中获取当前会话的标准 ID |
 | **resolve meta** | `resolve meta <id>` | 查询会话元数据（标题/时间/目录/摘要） |
 | **resolve content** | `resolve content <id>` | 查询会话消息正文（角色+正文片段序列） |
+| **list** | `list [--since 3d] [--framework ...]` | 枚举近期会话（标准 ID + 时间 + 标题，倒序） |
 
 ## 标准格式
 
@@ -149,6 +151,28 @@ bash "$SR" resolve content zcode:sess_xxx --limit 10 --offset 5
 **Claude Code 数据形态**：`user`/`assistant` 记录的 `message.content` 为 Anthropic API 形态（str 或 parts 数组）：`text` → `text`；`thinking` → `reasoning`；`tool_use`/`server_tool_use` → `tool`（pending）；`tool_result`/`server_tool_result` 按 `tool_use_id` 跨消息回填对应 tool part 的 status/output（不生成新 part）。跳过 `progress`/`file-history-snapshot`/`queue-operation`/`last-prompt`/`system` 等非对话 type；纯 tool_result 的 user 消息回填后无残余 part，不产出空消息。命令包装文本（`<local-command-caveat>` 等）按纯数据层不过滤。
 
 **调用时机**：需要读取历史会话内容做上下文恢复、跨会话知识传递、或 subagent 提炼。
+
+### list — 枚举近期会话
+
+```bash
+bash "$SR" list --since 3d                     # 全部框架，近 3 天
+bash "$SR" list --since 12h --framework zcode  # 单框架，近 12 小时
+bash "$SR" list --framework zcode,dsh          # 多框架（逗号分隔）
+```
+
+输出一行一条（制表符分隔），跨框架合并按最后活动时间倒序：
+
+```
+zcode:sess_xxx	2026-08-18 10:38	实施 session-resolver list 命令
+dsh:session-yyy	2026-08-17 22:33	验证dsh会话解析器适配
+```
+
+- `--since`：`3d` / `12h` / `30m`，可组合（`1d12h`）；不传 = 全量
+- `--framework`：`zcode|codex|dsh|claude-code` 逗号分隔多值；不传 = 全部框架合并
+- 时间语义：zcode 用 session 表 `time_updated`，其余框架用会话文件 mtime
+- 单框架容错：某框架数据根不存在（未安装该框架）或 dsh 的 zstd 缺失 → stderr 警告后跳过，不阻断其他框架
+
+**调用时机**：定时扫描近期会话回看（收集卡补录）、异步反思找"最近发生了什么"的入口——先 list 拿清单，再对值得深入的会话 resolve meta/content。
 
 ## 数据源
 
