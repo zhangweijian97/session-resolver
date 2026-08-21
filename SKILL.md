@@ -51,9 +51,9 @@ bash "$SR" identify
 **调用时机**：需要记录当前会话身份到目标卡、成长痕迹、HANDOFF 等跨会话载体时。
 
 **实现原理**（ZCode）：
-1. 从进程树（`ps -o command`）提取 `sess_<uuid>` 模式
-2. 框架检测（环境变量 `ZCODE_APP_VERSION` / `ZCODE_ENV`）
-3. 组合为标准格式输出
+1. 从进程树（`ps -o command`）提取 `sess_<uuid>` 模式（精确路径——命令行里的 sess 就是当前会话）
+2. 环境变量 `ZCODE_SESSION_ID` / `SESSION_ID` 次之
+3. 兜底：`~/.zcode/cli/rollout/model-io-sess_*.jsonl` 中 mtime 最新者（并发会话下可能误判，触发时 stderr 警告）
 
 **实现原理**（Codex）：
 1. 框架检测：环境变量 `CODEX_THREAD_ID` 存在 → codex

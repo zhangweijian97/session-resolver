@@ -7,8 +7,9 @@ set -euo pipefail
 
 # ─── 常量 ────────────────────────────────────────────
 
-readonly VERSION="0.5.0"
+readonly VERSION="0.5.1"
 readonly ZCODE_DB="${HOME}/.zcode/cli/db/db.sqlite"
+readonly ZCODE_ROLLOUT="${HOME}/.zcode/cli/rollout"
 readonly CODEX_ROOT="${CODEX_HOME:-${HOME}/.codex}"
 readonly CODEX_SESSIONS="${CODEX_ROOT}/sessions"
 readonly CODEX_ARCHIVED="${CODEX_ROOT}/archived_sessions"
@@ -311,12 +312,34 @@ identify() {
         fi
       fi
 
-      # 方法3：PPID 链路扫描（兜底，扫描更广的进程树）
+      # 方法3：mtime 最新兜底（goal-94ed9a）
+      # 旧实现为全进程扫描 ps|grep sess_|head -1 —— 并发会话下会抓到别的会话的 id（进程表里
+      # 所有活跃会话的 shell 包装进程命令行都含 sess_），是并发误判的直接来源。
+      # 兜底改为取 rollout/model-io-sess_*.jsonl 中 mtime 最新者，并显式警告降级
+      # （进程树无会话信息的场景，如从别的 shell 手动调用；并发下仍可能取到最近活跃的他方会话）。
       if [[ -z "$session_id" ]]; then
-        local all_cmds
-        all_cmds=$(ps -eo command 2>/dev/null | grep -oE 'sess_[a-f0-9-]+' | head -1) || true
-        if [[ -n "$all_cmds" ]]; then
-          session_id="$all_cmds"
+        session_id=$(python3 - "$ZCODE_ROLLOUT" <<'PY' || true
+import os, re, sys
+root = sys.argv[1]
+best, best_m = None, -1
+try:
+    for name in os.listdir(root):
+        m = re.match(r'model-io-(sess_[a-f0-9-]+)\.jsonl$', name)
+        if not m:
+            continue
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            mt = os.path.getmtime(path)
+            if mt > best_m:
+                best, best_m = m.group(1), mt
+except Exception:
+    pass
+if best:
+    print(best)
+PY
+)
+        if [[ -n "$session_id" ]]; then
+          echo "警告: 进程树与环境变量均无会话信息，identify 降级为 mtime 最新兜底（并发会话下可能误判）: ${session_id}" >&2
         fi
       fi
 
