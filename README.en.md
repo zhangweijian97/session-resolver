@@ -6,7 +6,7 @@ Cross-client session identity & content resolver for AI coding CLIs — one bash
 - **resolve**: read a session's metadata and message content by ID (returns JSON)
 - **list**: enumerate recent sessions (standard ID + time + title, `--since` filter)
 
-Supports **Claude Code / Codex / dsh (DeepSeek Harness) / ZCode** with a unified ID format and unified output structure — your script parses one format, regardless of which client produced the session.
+Supports **Claude Code / Codex / dsh (DeepSeek Harness) / ZCode / WorkBuddy** with a unified ID format and unified output structure — your script parses one format, regardless of which client produced the session.
 
 ## The Problem
 
@@ -38,15 +38,15 @@ Skill-system users (ZCode/OpenCode/Codex etc.): install `SKILL.md` alongside the
 ```bash
 # 1. Inside any supported client session (e.g. ask the AI to run it):
 ./session-resolver.sh identify
-# → claude-code:bc3e96c7-a925-4c2e-ac9a-ccf181a3a388
+# → claude-code:4a7f2c9d-8e1b-4c3a-9d5f-7b2e6a8c1d40
 
 # 2. Session metadata by standard ID:
-./session-resolver.sh resolve meta claude-code:bc3e96c7-a925-4c2e-ac9a-ccf181a3a388
+./session-resolver.sh resolve meta claude-code:4a7f2c9d-8e1b-4c3a-9d5f-7b2e6a8c1d40
 ```
 
 ```json
 {
-  "id": "bc3e96c7-a925-4c2e-ac9a-ccf181a3a388",
+  "id": "4a7f2c9d-8e1b-4c3a-9d5f-7b2e6a8c1d40",
   "title": "openclaw update │ ◇ Updating OpenClaw...",
   "time_created": 1781011620546,
   "time_updated": 1781011798037,
@@ -60,7 +60,7 @@ Skill-system users (ZCode/OpenCode/Codex etc.): install `SKILL.md` alongside the
 
 ```bash
 # 3. Message content (with optional paging):
-./session-resolver.sh resolve content claude-code:bc3e96c7-... --limit 10 --offset 5
+./session-resolver.sh resolve content claude-code:4a7f2c9d-... --limit 10 --offset 5
 ```
 
 content returns a unified message sequence; each message carries `role` / `time_created` / `parts`:
@@ -93,11 +93,13 @@ Part types are uniform across clients: `text` / `reasoning` / `tool` (call + res
 # 4. Enumerate recent sessions (merged across clients, newest first):
 ./session-resolver.sh list --since 3d
 ./session-resolver.sh list --since 12h --framework claude-code,codex
+./session-resolver.sh list --since 12h --framework workbuddy
 ```
 
 ```text
-claude-code:bc3e96c7-a925-4c2e-ac9a-ccf181a3a388	2026-08-18 01:11	verify the cc adapter
-codex:019fcaad-12a9-7351-b533-94a79f6bfa0b	2026-08-04 10:50	we switched the system prompt to a symlink...
+claude-code:4a7f2c9d-8e1b-4c3a-9d5f-7b2e6a8c1d40	2026-08-20 09:41	refactor error handling in login module
+workbuddy:e2b94f71-3c6d-4a8e-b5f0-9d1c7a3e5b28	2026-08-21 22:30	add an RSS feed to the blog
+codex:019f3b7e-c4a2-7d81-9e2f-5b6a8c4d1e73	2026-08-15 16:42	fix a path bug in the build script
 ```
 
 `--since` takes `3d` / `12h` / `30m` (combinable, e.g. `1d12h`); a missing client data root is skipped with a warning instead of failing the whole listing. Typical flow: `list` for the overview, then `resolve meta` / `resolve content` on the sessions worth a deeper look.
@@ -109,7 +111,7 @@ Clients expose session identity differently; field-tested into three shapes (ask
 | Shape | Mechanism | Example |
 |------|-----------|---------|
 | **env injection** | client injects a session identifier into child processes | Codex (`CODEX_THREAD_ID`) |
-| **process tree** | session ID appears in an ancestor's command line | ZCode (`sess_<uuid>`) |
+| **process tree** | session ID appears in an ancestor's command line | ZCode (`sess_<uuid>`), WorkBuddy (codebuddy `--session-id`) |
 | **storage back-query** | no injection, no process-tree trace — locate session storage by cwd, take newest mtime | dsh (workspace registry), Claude Code (projects dir) |
 
 Why the back-query works: identify runs inside the live session, whose record file was just written — its mtime is almost certainly the newest.
@@ -122,6 +124,7 @@ Why the back-query works: identify runs inside the live session, whose record fi
 | Codex | `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl` (+ `archived_sessions/`) | flat JSONL; one session may span files; title derived |
 | dsh | `~/.dsh/sessions/<cwd-encoded>--/<session-uuid>/session.jsonl.zstd` | zstd-compressed; workspace registry at `~/.dsh/storages/workspace.json` |
 | ZCode | `~/.zcode/cli/db/db.sqlite` | sqlite, three tables (session/message/part) |
+| WorkBuddy | `~/.workbuddy/workbuddy.db` + `projects/<cwd-encoded>/<sessionId>.jsonl` | sessions metadata + JSONL content; tools linked by callId |
 
 session-resolver is strictly read-only. Field-tested format details (type tables, duplicate shapes, derived fields) per client: [docs/adapters.md](docs/adapters.md).
 

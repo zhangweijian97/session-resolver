@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # session-resolver.sh — 会话身份适配器（identify + resolve）
 # 跨智能体框架的会话 ID 标准化与解析工具
-# 已适配: ZCode + Codex + dsh(DeepSeek Harness) + Claude Code
+# 已适配: ZCode + Codex + dsh(DeepSeek Harness) + Claude Code + WorkBuddy
 
 set -euo pipefail
 
 # ─── 常量 ────────────────────────────────────────────
 
-readonly VERSION="0.5.1"
+readonly VERSION="0.6.0"
 readonly ZCODE_DB="${HOME}/.zcode/cli/db/db.sqlite"
 readonly ZCODE_ROLLOUT="${HOME}/.zcode/cli/rollout"
 readonly CODEX_ROOT="${CODEX_HOME:-${HOME}/.codex}"
@@ -18,6 +18,9 @@ readonly DSH_SESSIONS="${DSH_ROOT}/sessions"
 readonly DSH_WORKSPACE_JSON="${DSH_ROOT}/storages/workspace.json"
 readonly CLAUDE_ROOT="${CLAUDE_CONFIG_DIR:-${HOME}/.claude}"
 readonly CLAUDE_PROJECTS="${CLAUDE_ROOT}/projects"
+readonly WORKBUDDY_ROOT="${WORKBUDDY_HOME:-${HOME}/.workbuddy}"
+readonly WORKBUDDY_DB="${WORKBUDDY_ROOT}/workbuddy.db"
+readonly WORKBUDDY_PROJECTS="${WORKBUDDY_ROOT}/projects"
 
 # ─── 工具函数 ────────────────────────────────────────
 
@@ -83,6 +86,10 @@ detect_framework() {
     echo "claude-code"
     return
   fi
+  if [[ -n "${WORKBUDDY_SESSION_ID:-}" ]]; then
+    echo "workbuddy"
+    return
+  fi
 
   # 进程树探测（$$ 向上找祖先进程）
   local pid=$$ cmds=""
@@ -95,6 +102,10 @@ detect_framework() {
   done
   if [[ "$cmds" =~ sess_[a-f0-9-]+ ]]; then
     echo "zcode"
+    return
+  fi
+  if printf '%s' "$cmds" | grep -qiE 'WorkBuddy\.app/.*/codebuddy|X-WorkBuddy-Session-Id'; then
+    echo "workbuddy"
     return
   fi
   if printf '%s' "$cmds" | grep -qE -- '--session-id[ =][ ]*[a-f0-9-]+'; then
@@ -243,10 +254,67 @@ PY
   echo "$session_id"
 }
 
+# WorkBuddy 实现：祖先进程 --session-id 主路径 + sessions 表按 cwd/最近活动反查兜底
+identify_workbuddy() {
+  local session_id="${WORKBUDDY_SESSION_ID:-}"
+
+  if [[ -z "$session_id" ]]; then
+    local pid=$$
+    for _ in $(seq 1 10); do
+      local cmd
+      cmd=$(ps -o command -p "$pid" 2>/dev/null | tail -1) || true
+      if printf '%s' "$cmd" | grep -qiE 'WorkBuddy\.app/.*/codebuddy|X-WorkBuddy-Session-Id'; then
+        session_id=$(printf '%s' "$cmd" \
+          | grep -oE -- '--session-id[ =][ ]*[a-f0-9-]{10,}' \
+          | head -1 \
+          | grep -oE '[a-f0-9-]{10,}' || true)
+        [[ -n "$session_id" ]] && break
+      fi
+      local ppid
+      ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || true
+      [[ -z "$ppid" || "$ppid" == "0" || "$ppid" == "1" ]] && break
+      pid="$ppid"
+    done
+  fi
+
+  if [[ -z "$session_id" && -f "$WORKBUDDY_DB" ]]; then
+    session_id=$(python3 - "$WORKBUDDY_DB" "$PWD" <<'PY' || true
+import os, sqlite3, sys
+
+db, pwd = sys.argv[1], os.path.realpath(sys.argv[2])
+try:
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    rows = list(con.execute(
+        "SELECT id, cwd, COALESCE(last_activity_at, updated_at, created_at) "
+        "FROM sessions WHERE deleted_at IS NULL"
+    ))
+    con.close()
+except Exception:
+    sys.exit(0)
+
+matching = []
+for sid, cwd, activity in rows:
+    if not cwd:
+        continue
+    cwd_real = os.path.realpath(cwd)
+    if pwd == cwd_real or pwd.startswith(cwd_real.rstrip(os.sep) + os.sep):
+        matching.append((1 if pwd == cwd_real else 0, activity or 0, sid))
+
+if matching:
+    print(max(matching)[2])
+PY
+)
+  fi
+
+  [[ -n "$session_id" ]] || die "无法识别当前 WorkBuddy 会话 ID（进程树无 session-id 且 sessions 表无 cwd 匹配）"
+  echo "$session_id"
+}
+
 # 在会话中获取当前会话的标准 ID
 # ZCode 实现：从进程树提取 sess_<uuid> + 环境变量检测框架
 # Codex 实现：CODEX_THREAD_ID 主路径 + 进程树/rollout 文件名兜底
 # dsh 实现：进程树检测框架 + workspace.json/mtime 反查 session
+# WorkBuddy 实现：codebuddy 祖先进程 --session-id + sessions 表 cwd 反查
 identify() {
   local session_id=""
   local framework
@@ -283,6 +351,11 @@ identify() {
     claude-code)
       session_id=$(identify_claude)
       echo "claude-code:${session_id}"
+      ;;
+
+    workbuddy)
+      session_id=$(identify_workbuddy)
+      echo "workbuddy:${session_id}"
       ;;
 
     zcode)
@@ -350,7 +423,7 @@ PY
       ;;
 
     *)
-      die "无法识别当前会话 ID（不在已适配框架 ZCode/Codex/dsh/Claude Code 会话环境中？）"
+      die "无法识别当前会话 ID（不在已适配框架 ZCode/Codex/dsh/Claude Code/WorkBuddy 会话环境中？）"
       ;;
   esac
 }
@@ -366,11 +439,12 @@ resolve_meta() {
   local framework
   framework=$(get_framework_prefix "$raw_id")
   case "$framework" in
+    workbuddy) resolve_meta_workbuddy "$session_id" ;;
     claude-code) resolve_meta_claude "$session_id" ;;
     codex) resolve_meta_codex "$session_id" ;;
     dsh) resolve_meta_dsh "$session_id" ;;
     zcode|"") resolve_meta_zcode "$session_id" ;;
-    *) die "框架 '$framework' 未适配（已适配: zcode, codex, dsh, claude-code）" ;;
+    *) die "框架 '$framework' 未适配（已适配: zcode, codex, dsh, claude-code, workbuddy）" ;;
   esac
 }
 
@@ -678,6 +752,69 @@ print(json.dumps({
 PY
 }
 
+find_workbuddy_session() {
+  local session_id="$1"
+  local found
+  found=$(find "$WORKBUDDY_PROJECTS" -mindepth 2 -maxdepth 2 -type f -name "${session_id}.jsonl" 2>/dev/null | head -1)
+  [[ -n "$found" ]] || die "WorkBuddy 会话不存在: ${session_id}"
+  echo "$found"
+}
+
+# WorkBuddy 实现：sessions 表为元数据真相源，projects JSONL 为正文
+resolve_meta_workbuddy() {
+  local session_id="$1"
+  local path
+  path=$(find_workbuddy_session "$session_id")
+  [[ -f "$WORKBUDDY_DB" ]] || die "WorkBuddy 数据库不存在: $WORKBUDDY_DB"
+
+  python3 - "$session_id" "$WORKBUDDY_DB" "$path" <<'PY'
+import json, sqlite3, sys
+
+sid, db, path = sys.argv[1], sys.argv[2], sys.argv[3]
+con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+row = con.execute(
+    "SELECT id, cwd, title, custom_title, status, created_at, updated_at, "
+    "last_activity_at, source_mode, mode, model, project_id "
+    "FROM sessions WHERE id = ? LIMIT 1",
+    (sid,),
+).fetchone()
+con.close()
+if row is None:
+    sys.stderr.write(f"WorkBuddy 会话不存在于 sessions 表: {sid}\n")
+    sys.exit(1)
+
+message_count = 0
+tool_call_count = 0
+with open(path) as fh:
+    for line in fh:
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("type") == "message":
+            message_count += 1
+        elif rec.get("type") == "function_call":
+            tool_call_count += 1
+
+print(json.dumps({
+    "id": row[0],
+    "title": row[3] or row[2] or row[0],
+    "time_created": row[5],
+    "time_updated": row[6],
+    "last_activity_at": row[7],
+    "directory": row[1],
+    "path": path,
+    "status": row[4],
+    "source_mode": row[8],
+    "mode": row[9],
+    "model": row[10],
+    "project_id": row[11],
+    "message_count": message_count,
+    "tool_call_count": tool_call_count,
+}, ensure_ascii=False, indent=2))
+PY
+}
+
 # ─── resolve: content ───────────────────────────────
 
 # 按框架前缀路由
@@ -702,11 +839,12 @@ resolve_content() {
   local framework
   framework=$(get_framework_prefix "$raw_id")
   case "$framework" in
+    workbuddy) resolve_content_workbuddy "$session_id" --limit "$limit" --offset "$offset" ;;
     claude-code) resolve_content_claude "$session_id" --limit "$limit" --offset "$offset" ;;
     codex) resolve_content_codex "$session_id" --limit "$limit" --offset "$offset" ;;
     dsh) resolve_content_dsh "$session_id" --limit "$limit" --offset "$offset" ;;
     zcode|"") resolve_content_zcode "$session_id" --limit "$limit" --offset "$offset" ;;
-    *) die "框架 '$framework' 未适配（已适配: zcode, codex, dsh, claude-code）" ;;
+    *) die "框架 '$framework' 未适配（已适配: zcode, codex, dsh, claude-code, workbuddy）" ;;
   esac
 }
 
@@ -1172,6 +1310,125 @@ print(json.dumps(messages, ensure_ascii=False, indent=2))
 PY
 }
 
+# WorkBuddy 实现：message/reasoning/function_call/function_call_result 四类对话记录
+# tool 结果按 callId 回填；ai-title/file-history-snapshot 不属于对话正文
+resolve_content_workbuddy() {
+  local session_id="$1"
+  shift
+
+  local limit="" offset=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit) limit="$2"; shift 2 ;;
+      --offset) offset="$2"; shift 2 ;;
+      *) die "未知参数: $1" ;;
+    esac
+  done
+
+  local path
+  path=$(find_workbuddy_session "$session_id")
+
+  python3 - "$session_id" "$limit" "$offset" "$path" <<'PY'
+import json, sys
+
+sid, limit_s, offset_s, path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+limit = int(limit_s) if limit_s else None
+offset = int(offset_s) if offset_s else 0
+
+messages = []
+assistant_by_id = {}
+last_turn_id = [""]
+tool_parts = {}
+
+def text_parts(content, accepted):
+    parts = []
+    for item in content if isinstance(content, list) else []:
+        if not isinstance(item, dict) or item.get("type") not in accepted:
+            continue
+        parts.append({"type": "text", "text": str(item.get("text", ""))})
+    return parts
+
+def assistant_turn(record_id, timestamp):
+    turn = assistant_by_id.get(record_id)
+    if turn is None:
+        turn = {"role": "assistant", "time_created": timestamp, "parts": []}
+        messages.append(turn)
+        assistant_by_id[record_id] = turn
+        last_turn_id[0] = record_id
+    return turn
+
+with open(path) as fh:
+    for line in fh:
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        record_type = rec.get("type")
+        timestamp = rec.get("timestamp")
+
+        if record_type == "message":
+            role = rec.get("role")
+            parts = text_parts(rec.get("content"), {"input_text", "output_text"})
+            if role == "assistant":
+                turn = assistant_turn(rec.get("id", ""), timestamp)
+                turn["parts"].extend(parts)
+            elif role == "user" and parts:
+                messages.append({"role": "user", "time_created": timestamp, "parts": parts})
+
+        elif record_type == "reasoning":
+            parts = []
+            for item in rec.get("rawContent") or []:
+                if isinstance(item, dict) and item.get("type") == "reasoning_text":
+                    parts.append({"type": "reasoning", "text": str(item.get("text", ""))})
+            if parts:
+                turn = assistant_turn(rec.get("id", ""), timestamp)
+                turn["parts"].extend(parts)
+
+        elif record_type == "function_call":
+            raw_input = rec.get("arguments")
+            try:
+                parsed_input = json.loads(raw_input) if isinstance(raw_input, str) else raw_input
+            except Exception:
+                parsed_input = raw_input
+            part = {
+                "type": "tool",
+                "tool": rec.get("name", ""),
+                "call_id": rec.get("callId", ""),
+                "status": "pending",
+                "input": parsed_input,
+                "output": None,
+            }
+            # 工具回合：优先挂同 id 的 assistant 消息（text+tools 同回合）；
+            # 其次挂 parentId 指向的 turn；parentId 可能指向 function_call_result
+            # 等非对话记录 → 挂最近创建的 assistant turn，不新建孤立回合
+            turn_id = rec.get("id", "")
+            if turn_id not in assistant_by_id:
+                turn_id = rec.get("parentId", "") or turn_id
+            if turn_id not in assistant_by_id:
+                turn_id = last_turn_id[0] or turn_id
+            assistant_turn(turn_id, timestamp)["parts"].append(part)
+            tool_parts[rec.get("callId", "")] = part
+
+        elif record_type == "function_call_result":
+            target = tool_parts.get(rec.get("callId", ""))
+            if target is None:
+                continue
+            output = rec.get("output")
+            if isinstance(output, dict) and output.get("type") == "text":
+                output = output.get("text", "")
+            target["status"] = rec.get("status") or "completed"
+            target["output"] = output
+
+messages = [message for message in messages if message.get("parts")]
+if offset > 0:
+    messages = messages[offset:]
+if limit is not None:
+    messages = messages[:limit]
+
+print(json.dumps(messages, ensure_ascii=False, indent=2))
+PY
+}
+
 # ─── list：近期会话枚举 ──────────────────────────────
 
 # 枚举近期会话（标准 ID + 最后活动时间 + 标题），跨框架合并按时间倒序
@@ -1191,8 +1448,8 @@ list_sessions() {
     local fw
     for fw in ${frameworks//,/ }; do
       case "$fw" in
-        zcode|codex|dsh|claude-code) ;;
-        *) die "未知框架: '$fw'（可用: zcode, codex, dsh, claude-code）" ;;
+        zcode|codex|dsh|claude-code|workbuddy) ;;
+        *) die "未知框架: '$fw'（可用: zcode, codex, dsh, claude-code, workbuddy）" ;;
       esac
     done
   fi
@@ -1216,7 +1473,7 @@ if since_raw:
     since_s = time.time() - total
 
 frameworks = [f.strip() for f in fw_raw.split(",") if f.strip()] \
-    or ["zcode", "codex", "dsh", "claude-code"]
+    or ["zcode", "codex", "dsh", "claude-code", "workbuddy"]
 
 rows = []  # (mtime_epoch, standard_id, title)
 
@@ -1389,6 +1646,25 @@ if "claude-code" in frameworks:
                     continue
                 rows.append((mt, f"claude-code:{name[:-len('.jsonl')]}", claude_title(p)))
 
+# --- workbuddy: sessions 表枚举（updated_at 毫秒，title 显式）---
+if "workbuddy" in frameworks:
+    wb_root = os.environ.get("WORKBUDDY_HOME", os.path.join(home, ".workbuddy"))
+    db = os.path.join(wb_root, "workbuddy.db")
+    if not os.path.isfile(db):
+        sys.stderr.write(f"警告: workbuddy 数据库不存在，跳过（{db}）\n")
+    else:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            for sid, title, custom_title, updated_at in con.execute(
+                "SELECT id, title, custom_title, updated_at FROM sessions "
+                "WHERE deleted_at IS NULL AND updated_at > ?",
+                (int(since_s * 1000),),
+            ):
+                rows.append((updated_at / 1000, f"workbuddy:{sid}", clean_title(custom_title or title or sid)))
+            con.close()
+        except Exception as e:
+            sys.stderr.write(f"警告: workbuddy 枚举失败: {e}\n")
+
 rows.sort(key=lambda r: r[0], reverse=True)
 for mt, sid, title in rows:
     print(f"{sid}\t{time.strftime('%Y-%m-%d %H:%M', time.localtime(mt))}\t{title}")
@@ -1406,7 +1682,8 @@ session-resolver v${VERSION} — 会话身份适配器
     在会话中获取当前会话的标准 ID（格式: <框架>:<session-id>）
     已适配框架: zcode（进程树 sess_ + 环境变量）、codex（CODEX_THREAD_ID）、
                 dsh（进程树 + workspace.json/mtime 反查）、
-                claude-code（CLAUDECODE 环境变量 + projects mtime 反查）
+                claude-code（CLAUDECODE 环境变量 + projects mtime 反查）、
+                workbuddy（codebuddy 进程 --session-id + sessions 表 cwd 反查）
 
   session-resolver.sh resolve meta <标准ID>
     查询会话元数据（标题/时间/目录/摘要）
@@ -1415,7 +1692,7 @@ session-resolver v${VERSION} — 会话身份适配器
     查询会话消息正文（角色 + 正文片段序列）
     可选 --limit/--offset 分段查询
 
-  session-resolver.sh list [--since 3d] [--framework zcode|codex|dsh|claude-code]
+  session-resolver.sh list [--since 3d] [--framework zcode|codex|dsh|claude-code|workbuddy]
     枚举近期会话（标准 ID + 最后活动时间 + 标题），按时间倒序
     --since: 时间过滤（3d / 12h / 30m，可组合如 1d12h；不传 = 全量）
     --framework: 逗号分隔多值过滤；不传 = 全部框架合并
@@ -1433,12 +1710,14 @@ session-resolver v${VERSION} — 会话身份适配器
   Codex 示例: codex:019fc5c5-bf07-7c91-b165-9aa3ef8b2861
   dsh 示例:   dsh:session-b52d2aa0-f5c7-41d5-b14e-57b607ea9285
   Claude Code 示例: claude-code:bc3e96c7-a925-4c2e-ac9a-ccf181a3a388
+  WorkBuddy 示例: workbuddy:b49d35a8-ce0e-4ad4-8fb0-14b91ebada1d
 
 数据源:
   ZCode: ${ZCODE_DB}
   Codex: ${CODEX_SESSIONS}/<YYYY>/<MM>/<DD>/rollout-*.jsonl（+ ${CODEX_ARCHIVED}）
   dsh:   ${DSH_SESSIONS}/<cwd编码>--/<session-uuid>/session.jsonl.zstd（zstd 压缩 JSONL，需 zstd）
   Claude Code: ${CLAUDE_PROJECTS}/<cwd编码>/<sessionId>.jsonl（subagents 子目录 MVP 不解析）
+  WorkBuddy: ${WORKBUDDY_DB} + ${WORKBUDDY_PROJECTS}/<cwd编码>/<sessionId>.jsonl
   （只读查询，不写入数据库）
 EOF
 }

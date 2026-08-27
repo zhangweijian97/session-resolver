@@ -5,8 +5,8 @@ description: >
   提供三个核心能力：identify（在会话中获取自己的标准 ID）、resolve（按 ID 查询会话内容）、
   list（枚举近期会话）。当需要获取当前会话 ID、跨会话读取历史会话内容（元数据/消息正文）、
   或扫近期会话清单（定时回看/异步反思入口）时触发。
-version: 0.5.0
-tags: [session, identity, resolver, zcode, codex, dsh, claude-code]
+version: 0.6.0
+tags: [session, identity, resolver, zcode, codex, dsh, claude-code, workbuddy]
 ---
 
 # session-resolver
@@ -31,9 +31,10 @@ ZCode 示例: zcode:sess_bd2e826f-0932-48ec-8a03-0e7869f3bab8
 Codex 示例: codex:019fc5c5-bf07-7c91-b165-9aa3ef8b2861
 dsh 示例:   dsh:session-b52d2aa0-f5c7-41d5-b14e-57b607ea9285
 Claude Code 示例: claude-code:bc3e96c7-a925-4c2e-ac9a-ccf181a3a388
+WorkBuddy 示例: workbuddy:b49d35a8-ce0e-4ad4-8fb0-14b91ebada1d
 ```
 
-resolve 时脚本自动解析前缀路由到对应框架的查询逻辑。已适配 `zcode:` + `codex:` + `dsh:` + `claude-code:` 前缀。
+resolve 时脚本自动解析前缀路由到对应框架的查询逻辑。已适配 `zcode:` + `codex:` + `dsh:` + `claude-code:` + `workbuddy:` 前缀。
 
 ## 使用方法
 
@@ -70,7 +71,12 @@ bash "$SR" identify
 2. 提取 session-id（存储层反查，与 dsh 同构）：正向编码 `$PWD` → `~/.claude/projects/<编码>/` 目录下 mtime 最新的 `<uuid>.jsonl` 文件名；编码目录不存在时回退全局顶层 jsonl mtime 最新（深度 2 天然排除 `subagents/`）
 3. 组合为标准格式输出
 
-框架检测顺序：显式框架环境变量（zcode / codex / claude-code）→ 进程树探测（sess_ → zcode；--session-id → codex；dsh server → dsh）。
+**实现原理**（WorkBuddy）：
+1. 框架检测：祖先进程含 WorkBuddy `codebuddy` 标记；进程命令同时携带 `--session-id <uuid>`
+2. 提取 session-id：祖先进程参数为主路径；`~/.workbuddy/workbuddy.db` 的 sessions 表按 `$PWD` 匹配最近活动会话为兜底
+3. 组合为标准格式输出
+
+框架检测顺序：显式框架环境变量（zcode / codex / claude-code / workbuddy）→ 进程树探测（sess_ → zcode；WorkBuddy codebuddy → workbuddy；通用 --session-id → codex；dsh server → dsh）。WorkBuddy 必须先于通用 `--session-id` 判定，避免被误识别为 Codex。
 
 ### resolve meta — 查询会话元数据
 
@@ -102,6 +108,8 @@ bash "$SR" resolve meta zcode:sess_xxx
 **dsh meta 字段**：`id` / `title`（显式：`session/title` 记录，无需派生）/ `time_created` / `time_updated` / `directory`（cwd）/ `path` / `model` / `provider` / `message_count`。
 
 **Claude Code meta 字段**：`id` / `title`（派生：首条用户文本消息截断，slug 兜底）/ `time_created` / `time_updated` / `directory`（cwd）/ `path` / `message_count` / `cli_version` / `git_branch` / `slug`。
+
+**WorkBuddy meta 字段**：`id` / `title`（sessions 表显式字段）/ `time_created` / `time_updated` / `last_activity_at` / `directory`（cwd）/ `path` / `status` / `source_mode` / `mode` / `model` / `project_id` / `message_count` / `tool_call_count`。
 
 ### resolve content — 查询会话消息正文
 
@@ -150,6 +158,8 @@ bash "$SR" resolve content zcode:sess_xxx --limit 10 --offset 5
 
 **Claude Code 数据形态**：`user`/`assistant` 记录的 `message.content` 为 Anthropic API 形态（str 或 parts 数组）：`text` → `text`；`thinking` → `reasoning`；`tool_use`/`server_tool_use` → `tool`（pending）；`tool_result`/`server_tool_result` 按 `tool_use_id` 跨消息回填对应 tool part 的 status/output（不生成新 part）。跳过 `progress`/`file-history-snapshot`/`queue-operation`/`last-prompt`/`system` 等非对话 type；纯 tool_result 的 user 消息回填后无残余 part，不产出空消息。命令包装文本（`<local-command-caveat>` 等）按纯数据层不过滤。
 
+**WorkBuddy 数据形态**：`message` 的 `input_text` / `output_text` → `text`；`reasoning.rawContent[].reasoning_text` → `reasoning`；`function_call` → `tool`，`function_call_result` 按 `callId` 回填 status/output。并行工具共享 assistant message id，解析时挂回同一 assistant turn；跳过 `ai-title` / `file-history-snapshot`。首条 user 文本含 `<system-reminder>` 与 `<user_query>` 包装，按纯数据层不过滤；title 从 sessions 表读取，不从包装文本派生。
+
 **调用时机**：需要读取历史会话内容做上下文恢复、跨会话知识传递、或 subagent 提炼。
 
 ### list — 枚举近期会话
@@ -168,8 +178,8 @@ dsh:session-yyy	2026-08-17 22:33	验证dsh会话解析器适配
 ```
 
 - `--since`：`3d` / `12h` / `30m`，可组合（`1d12h`）；不传 = 全量
-- `--framework`：`zcode|codex|dsh|claude-code` 逗号分隔多值；不传 = 全部框架合并
-- 时间语义：zcode 用 session 表 `time_updated`，其余框架用会话文件 mtime
+- `--framework`：`zcode|codex|dsh|claude-code|workbuddy` 逗号分隔多值；不传 = 全部框架合并
+- 时间语义：zcode/workbuddy 用 session 表 `time_updated`，其余框架用会话文件 mtime
 - 单框架容错：某框架数据根不存在（未安装该框架）或 dsh 的 zstd 缺失 → stderr 警告后跳过，不阻断其他框架
 
 **调用时机**：定时扫描近期会话回看（收集卡补录）、异步反思找"最近发生了什么"的入口——先 list 拿清单，再对值得深入的会话 resolve meta/content。
@@ -203,6 +213,13 @@ dsh:session-yyy	2026-08-17 22:33	验证dsh会话解析器适配
 - sessionId/cwd/version/gitBranch/slug 冗余在每条记录（无独立 meta 记录）；subagent 会话存于 `<sessionId>/subagents/` 子目录，MVP 不解析
 - 无 title 显式记录，title 派生（首条用户消息截断，slug 兜底）
 - `CLAUDE_CONFIG_DIR` 环境变量可覆盖数据根目录（默认 `~/.claude`）
+
+**WorkBuddy**：`~/.workbuddy/workbuddy.db`（sessions 元数据）+ `~/.workbuddy/projects/<cwd编码>/<sessionId>.jsonl`（正文）
+
+- sessions 表提供 id/cwd/title/status/时间/model 等元数据
+- JSONL 记录 `message` / `reasoning` / `function_call` / `function_call_result`；工具调用与返回按 `callId` 一一关联
+- 已完成会话仍保留在 sessions 表与 projects 目录；当前未假设独立归档位
+- `WORKBUDDY_HOME` 环境变量可覆盖数据根目录（默认 `~/.workbuddy`）
 
 **只读查询**——session-resolver 不写入任何框架数据源，归档由各框架负责。
 

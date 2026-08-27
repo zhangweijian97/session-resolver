@@ -1,6 +1,6 @@
 # 各客户端数据源实测真相与适配勘察清单
 
-> 本文是四个已适配客户端的实测勘察记录（数据源形态、记录类型全表、坑），以及适配新客户端的 8 条勘察清单。目标读者：想深入使用 resolve 输出的开发者、想贡献新 adapter 的贡献者。
+> 本文是五个已适配客户端的实测勘察记录（数据源形态、记录类型全表、坑），以及适配新客户端的 8 条勘察清单。目标读者：想深入使用 resolve 输出的开发者、想贡献新 adapter 的贡献者。
 >
 > 所有结论来自真实会话数据的实测（非官方文档推断），客户端版本以实测时点为准——格式可能随客户端升级漂移，发现问题欢迎提 issue。
 
@@ -70,6 +70,29 @@
 - part 的工具调用与返回是**同一个 part**（统一 `type: "tool"`，`state.input` + `state.output`），不拆分。
 - identify 从进程树提取 `sess_<uuid>`（环境变量 `ZCODE_APP_VERSION`/`ZCODE_ENV` 检测框架）。
 - artifacts 目录（`~/.zcode/cli/artifacts/sess_<id>/`）只是文件变更快照，对话正文在 sqlite 的 part 表。
+
+## WorkBuddy
+
+**存储**：`~/.workbuddy/workbuddy.db` 的 `sessions` 表保存元数据；正文位于 `~/.workbuddy/projects/<cwd编码>/<sessionId>.jsonl`。
+
+**记录类型全表**（2026-08-27 两个真实会话，复杂样本 64 条记录）：
+
+| type | 内容 | 消费 |
+|------|------|------|
+| `message` | user/assistant 正文，parts 为 `input_text` / `output_text` | content |
+| `reasoning` | `rawContent[].reasoning_text` | content |
+| `function_call` / `function_call_result` | 工具调用与返回 | content，按 `callId` 关联 |
+| `ai-title` | 显式标题事件 | meta 兜底；主路径读 sessions 表 |
+| `file-history-snapshot` | 文件变更快照 | 跳过 |
+
+**坑与要点**：
+
+- WorkBuddy 的 `codebuddy` 祖先进程携带 `--session-id <uuid>`，同时可能在 MCP header 中出现 `X-WorkBuddy-Session-Id`；框架判定必须先识别 WorkBuddy 进程，再解析通用 `--session-id`，否则会误判成 Codex。
+- 多个并行 `function_call` 可共享同一个 assistant message id；调用与返回以 `callId` 一一对应，复杂样本 18/18 完整匹配。
+- 首条 user input 含 `<system-reminder>` 与 `<user_query>` 包装，没有独立干净用户记录；按纯数据层保留原文，title 使用 sessions 表显式字段。
+- `function_call.arguments` 是 JSON 字符串；`function_call_result.output` 当前为 `{type: text, text}` 对象。
+- completed 会话仍保留在 sessions 表与 projects 目录；当前未观察到独立归档位。
+- 环境变量 `WORKBUDDY_HOME` 可覆盖数据根目录。
 
 ## 适配新客户端：8 条勘察清单
 

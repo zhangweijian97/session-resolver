@@ -6,7 +6,7 @@
 - **resolve**：按 ID 读取会话的元数据与消息正文（返回 JSON）
 - **list**：枚举近期会话（标准 ID + 时间 + 标题，`--since` 时间过滤）
 
-支持 **Claude Code / Codex / dsh（DeepSeek Harness）/ ZCode** 四种客户端，统一 ID 格式、统一输出结构——你的脚本只写一份解析逻辑，不随框架分叉。
+支持 **Claude Code / Codex / dsh（DeepSeek Harness）/ ZCode / WorkBuddy** 五种客户端，统一 ID 格式、统一输出结构——你的脚本只写一份解析逻辑，不随框架分叉。
 
 ## 解决什么问题
 
@@ -38,15 +38,15 @@ AI 客户端技能体系用户：仓库内的 `SKILL.md` 可作为技能描述�
 ```bash
 # 1. 在任一已适配客户端的会话中（如让 AI 帮你跑）：
 ./session-resolver.sh identify
-# → claude-code:bc3e96c7-a925-4c2e-ac9a-ccf181a3a388
+# → claude-code:4a7f2c9d-8e1b-4c3a-9d5f-7b2e6a8c1d40
 
 # 2. 按标准 ID 查会话元数据：
-./session-resolver.sh resolve meta claude-code:bc3e96c7-a925-4c2e-ac9a-ccf181a3a388
+./session-resolver.sh resolve meta claude-code:4a7f2c9d-8e1b-4c3a-9d5f-7b2e6a8c1d40
 ```
 
 ```json
 {
-  "id": "bc3e96c7-a925-4c2e-ac9a-ccf181a3a388",
+  "id": "4a7f2c9d-8e1b-4c3a-9d5f-7b2e6a8c1d40",
   "title": "openclaw update │ ◇ Updating OpenClaw...",
   "time_created": 1781011620546,
   "time_updated": 1781011798037,
@@ -60,7 +60,7 @@ AI 客户端技能体系用户：仓库内的 `SKILL.md` 可作为技能描述�
 
 ```bash
 # 3. 读消息正文（支持分段）：
-./session-resolver.sh resolve content claude-code:bc3e96c7-... --limit 10 --offset 5
+./session-resolver.sh resolve content claude-code:4a7f2c9d-... --limit 10 --offset 5
 ```
 
 content 返回统一的消息序列，每条消息含 `role` / `time_created` / `parts`（正文片段数组）：
@@ -93,11 +93,13 @@ part 类型在所有框架间统一：`text`（正文）/ `reasoning`（模型�
 # 4. 枚举近期会话（跨客户端合并，按最后活动时间倒序）：
 ./session-resolver.sh list --since 3d
 ./session-resolver.sh list --since 12h --framework claude-code,codex
+./session-resolver.sh list --since 12h --framework workbuddy
 ```
 
 ```text
-claude-code:bc3e96c7-a925-4c2e-ac9a-ccf181a3a388	2026-08-18 01:11	验证一下会话解析器的cc适配
-codex:019fcaad-12a9-7351-b533-94a79f6bfa0b	2026-08-04 10:50	我们将系统提示词改成了软链接的形式...
+claude-code:4a7f2c9d-8e1b-4c3a-9d5f-7b2e6a8c1d40	2026-08-20 09:41	重构登录模块的错误处理
+workbuddy:e2b94f71-3c6d-4a8e-b5f0-9d1c7a3e5b28	2026-08-21 22:30	给博客加 RSS 订阅
+codex:019f3b7e-c4a2-7d81-9e2f-5b6a8c4d1e73	2026-08-15 16:42	修一下构建脚本的路径问题
 ```
 
 `--since` 支持 `3d` / `12h` / `30m`（可组合如 `1d12h`）；某客户端未安装时自动跳过并警告，不阻断其他客户端枚举。典型用法：先 `list` 拿清单，再对值得深入的会话 `resolve meta` / `resolve content`。
@@ -109,7 +111,7 @@ codex:019fcaad-12a9-7351-b533-94a79f6bfa0b	2026-08-04 10:50	我们将系统提�
 | 形态 | 机制 | 实例 |
 |------|------|------|
 | **环境变量注入** | 客户端给子进程注入会话标识 | Codex（`CODEX_THREAD_ID`） |
-| **进程树提取** | 会话 ID 出现在祖先进程命令行里 | ZCode（`sess_<uuid>`） |
+| **进程树提取** | 会话 ID 出现在祖先进程命令行里 | ZCode（`sess_<uuid>`）、WorkBuddy（codebuddy `--session-id`） |
 | **存储层反查** | 无注入、进程树也没有——按 cwd 定位会话存储，取 mtime 最新 | dsh（workspace 注册表）、Claude Code（projects 目录） |
 
 存储层反查的可靠性判据：identify 在活跃会话中调用，当前会话的记录文件刚被写入，mtime 几乎必然最新。
@@ -122,6 +124,7 @@ codex:019fcaad-12a9-7351-b533-94a79f6bfa0b	2026-08-04 10:50	我们将系统提�
 | Codex | `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl`（+ `archived_sessions/`） | 平铺 JSONL；同一会话可跨文件续接；title 需派生 |
 | dsh | `~/.dsh/sessions/<cwd编码>--/<session-uuid>/session.jsonl.zstd` | zstd 压缩；workspace 注册表在 `~/.dsh/storages/workspace.json` |
 | ZCode | `~/.zcode/cli/db/db.sqlite` | sqlite 三表（session/message/part） |
+| WorkBuddy | `~/.workbuddy/workbuddy.db` + `projects/<cwd编码>/<sessionId>.jsonl` | sessions 元数据 + JSONL 正文；工具按 callId 关联 |
 
 session-resolver 只读不写，不改动任何客户端数据。各框架记录格式的实测细节（类型全表、重复形态、字段派生）见 [docs/adapters.md](docs/adapters.md)。
 
