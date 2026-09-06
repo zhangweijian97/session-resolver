@@ -827,11 +827,19 @@ resolve_content() {
   local offset=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --limit) limit="$2"; shift 2 ;;
-      --offset) offset="$2"; shift 2 ;;
+      --limit)
+        [[ $# -ge 2 ]] || die "--limit 需要一个值（示例: --limit 10）"
+        limit="$2"; shift 2 ;;
+      --offset)
+        [[ $# -ge 2 ]] || die "--offset 需要一个值（示例: --offset 5）"
+        offset="$2"; shift 2 ;;
       *) die "未知参数: $1" ;;
     esac
   done
+
+  # 参数校验（入口层，所有框架路径共享）：仅接受非负整数
+  [[ -z "$limit" || "$limit" =~ ^[0-9]+$ ]] || die "无效 --limit 值: '$limit'（需非负整数，示例: --limit 10）"
+  [[ -z "$offset" || "$offset" =~ ^[0-9]+$ ]] || die "无效 --offset 值: '$offset'（需非负整数，示例: --offset 5）"
 
   local session_id
   session_id=$(strip_prefix "$raw_id")
@@ -866,16 +874,7 @@ resolve_content_zcode() {
   check_sqlite3
   check_db
 
-  # 构建 limit/offset SQL 片段
-  local limit_sql=""
-  if [[ -n "$limit" ]]; then
-    limit_sql="LIMIT ${limit}"
-    if [[ -n "$offset" ]]; then
-      limit_sql="LIMIT ${limit} OFFSET ${offset}"
-    fi
-  fi
-
-  # 查询 message + part，按时间排序
+  # 查询 message + part，按时间排序（全量查询，分页在聚合后按消息级切片）
   # message.data 含 role（JSON），part.data 含 type + 正文（JSON）
   local query
   query="
@@ -888,8 +887,7 @@ resolve_content_zcode() {
     FROM message m
     LEFT JOIN part p ON p.message_id = m.id
     WHERE m.session_id = '${session_id}'
-    ORDER BY m.time_created ASC, p.id ASC
-    ${limit_sql};
+    ORDER BY m.time_created ASC, p.id ASC;
   "
 
   local raw
@@ -900,11 +898,15 @@ resolve_content_zcode() {
     return
   fi
 
-  # 用 python3 聚合成消息序列（每条消息含 parts 数组）
+  # 用 python3 聚合成消息序列（每条消息含 parts 数组），--limit/--offset 按消息级切片
   echo "$raw" | python3 -c "
 import json, sys
 
 rows = json.load(sys.stdin)
+
+limit_s, offset_s = sys.argv[1], sys.argv[2]
+limit = int(limit_s) if limit_s else None
+offset = int(offset_s) if offset_s else 0
 
 messages = []
 current_msg = None
@@ -974,8 +976,13 @@ if current_msg is not None:
     del current_msg['_id']
     messages.append(current_msg)
 
+if offset > 0:
+    messages = messages[offset:]
+if limit is not None:
+    messages = messages[:limit]
+
 print(json.dumps(messages, ensure_ascii=False, indent=2))
-"
+" "$limit" "$offset"
 }
 
 # Codex 实现：解析 rollout JSONL 的 response_item 序列
